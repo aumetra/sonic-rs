@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     num::NonZeroU8,
     ops::Deref,
     slice::{from_raw_parts, from_raw_parts_mut},
@@ -10,7 +11,8 @@ use faststr::FastStr;
 use serde::de::{self, Expected, Unexpected};
 use smallvec::SmallVec;
 
-use super::reader::{Reader, Reference};
+use super::{as_str, DEFAULT_KEY_BUF_CAPACITY};
+use crate::reader::{Reader, Reference};
 #[cfg(all(target_feature = "neon", target_arch = "aarch64"))]
 use crate::util::simd::bits::NeonBits;
 use crate::{
@@ -28,18 +30,14 @@ use crate::{
         arc::Arc,
         arch::{get_nonspace_bits, prefix_xor},
         num::{parse_number, ParserNumber},
-        simd::{i8x32, m8x32, u8x32, u8x64, Mask, Simd},
+        //simd::{i8x32, m8x32, u8x32, u8x64, Mask, Simd},
+        simd::{Mask, Simd},
         string::*,
         unicode::{codepoint_to_utf8, hex_to_u32_nocheck},
     },
     value::{shared::Shared, visitor::JsonVisitor},
     JsonType, LazyValue,
 };
-
-pub(crate) const DEFAULT_KEY_BUF_CAPACITY: usize = 128;
-pub(crate) fn as_str(data: &[u8]) -> &str {
-    unsafe { from_utf8_unchecked(data) }
-}
 
 #[inline(always)]
 fn get_escaped_branchless_u32(prev_escaped: &mut u32, backslash: u32) -> u32 {
@@ -91,7 +89,11 @@ pub(crate) fn is_whitespace(ch: u8) -> bool {
 }
 
 #[inline(always)]
-fn get_string_bits(data: &[u8; 64], prev_instring: &mut u64, prev_escaped: &mut u64) -> u64 {
+fn get_string_bits<u8x64>(data: &[u8; 64], prev_instring: &mut u64, prev_escaped: &mut u64) -> u64
+where
+    u8x64: Simd<Element = u8>,
+    u8x64::Mask: Mask<BitMask = u64>,
+{
     let v = unsafe { u8x64::from_slice_unaligned_unchecked(data) };
 
     let bs_bits = (v.eq(&u8x64::splat(b'\\'))).bitmask();
@@ -109,7 +111,7 @@ fn get_string_bits(data: &[u8; 64], prev_instring: &mut u64, prev_escaped: &mut 
 }
 
 #[inline(always)]
-fn skip_container_loop(
+fn skip_container_loop<u8x64>(
     input: &[u8; 64],        /* a 64-bytes slice from json */
     prev_instring: &mut u64, /* the bitmap of last string */
     prev_escaped: &mut u64,
@@ -117,9 +119,13 @@ fn skip_container_loop(
     rbrace_num: &mut usize,
     left: u8,
     right: u8,
-) -> Option<NonZeroU8> {
+) -> Option<NonZeroU8>
+where
+    u8x64: Simd<Element = u8>,
+    u8x64::Mask: Mask<BitMask = u64>,
+{
     // get the bitmao
-    let instring = get_string_bits(input, prev_instring, prev_escaped);
+    let instring = get_string_bits::<u8x64>(input, prev_instring, prev_escaped);
     // #Safety
     // the input is 64 bytes, so the v is always valid.
     let v = unsafe { u8x64::from_slice_unaligned_unchecked(input) };
@@ -141,12 +147,14 @@ fn skip_container_loop(
     None
 }
 
-pub(crate) struct Parser<R> {
-    pub(crate) read: R,
-    error_index: usize,                     // mark the error position
-    nospace_bits: u64,                      // SIMD marked nospace bitmap
-    nospace_start: isize,                   // the start position of nospace_bits
-    pub(crate) shared: Option<Arc<Shared>>, // the shared allocator for `Value`
+pub(crate) struct Parser<R, i8x32, u8x32, u8x64> {
+    read: R,
+    error_index: usize,          // mark the error position
+    nospace_bits: u64,           // SIMD marked nospace bitmap
+    nospace_start: isize,        // the start position of nospace_bits
+    shared: Option<Arc<Shared>>, // the shared allocator for `Value`
+
+    _marker: PhantomData<(i8x32, u8x32, u8x64)>,
 }
 
 /// Records the parse status
@@ -156,9 +164,15 @@ pub(crate) enum ParseStatus {
     HasEscaped,
 }
 
-impl<'de, R> Parser<R>
+impl<'de, R, i8x32, u8x32, u8x64> Parser<R, i8x32, u8x32, u8x64>
 where
     R: Reader<'de>,
+    i8x32: Simd<Element = i8>,
+    i8x32::Mask: Mask<BitMask = u32>,
+    u8x32: Simd<Element = u8>,
+    u8x32::Mask: Mask<BitMask = u32>,
+    u8x64: Simd<Element = u8>,
+    u8x64::Mask: Mask<BitMask = u64>,
 {
     pub fn new(read: R) -> Self {
         Self {
@@ -167,7 +181,14 @@ where
             nospace_bits: 0,
             nospace_start: -128,
             shared: None,
+
+            _marker: PhantomData,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn read(&mut self) -> &mut R {
+        &mut self.read
     }
 
     #[inline(always)]
@@ -966,10 +987,9 @@ where
     #[inline(always)]
     fn get_next_token<const N: usize>(&mut self, tokens: [u8; N], advance: usize) -> Option<u8> {
         let r = &mut self.read;
-        const LANS: usize = u8x32::lanes();
-        while let Some(chunk) = r.peek_n(LANS) {
+        while let Some(chunk) = r.peek_n(u8x32::LANES) {
             let v = unsafe { u8x32::from_slice_unaligned_unchecked(chunk) };
-            let mut vor = m8x32::splat(false);
+            let mut vor = u8x32::Mask::splat(false);
             for t in tokens.iter().take(N) {
                 vor |= v.eq(&u8x32::splat(*t));
             }
@@ -980,7 +1000,7 @@ where
                 r.eat(cnt + advance);
                 return Some(ch);
             }
-            r.eat(LANS);
+            r.eat(u8x32::LANES);
         }
 
         while let Some(ch) = r.peek() {
@@ -999,14 +1019,13 @@ where
     // escaped status. skip_string always start with the quote marks.
     #[inline(always)]
     fn skip_string_impl(&mut self) -> Result<ParseStatus> {
-        const LANS: usize = u8x32::lanes();
         let r = &mut self.read;
         let mut quote_bits;
         let mut escaped;
         let mut prev_escaped = 0;
         let mut status = ParseStatus::None;
 
-        while let Some(chunk) = r.peek_n(LANS) {
+        while let Some(chunk) = r.peek_n(u8x32::LANES) {
             let v = unsafe { u8x32::from_slice_unaligned_unchecked(chunk) };
             let bs_bits = (v.eq(&u8x32::splat(b'\\'))).bitmask();
             quote_bits = (v.eq(&u8x32::splat(b'"'))).bitmask();
@@ -1022,7 +1041,7 @@ where
                 r.eat(quote_bits.trailing_zeros() as usize + 1);
                 return Ok(status);
             }
-            r.eat(LANS)
+            r.eat(u8x32::LANES)
         }
 
         // skip the possible prev escaped quote
@@ -1078,10 +1097,8 @@ where
     // skip_string skips a JSON string with validation.
     #[inline(always)]
     fn skip_string(&mut self) -> Result<ParseStatus> {
-        const LANS: usize = u8x32::lanes();
-
         let mut status = ParseStatus::None;
-        while let Some(chunk) = self.read.peek_n(LANS) {
+        while let Some(chunk) = self.read.peek_n(u8x32::LANES) {
             let v = unsafe { u8x32::from_slice_unaligned_unchecked(chunk) };
             let v_bs = v.eq(&u8x32::splat(b'\\'));
             let v_quote = v.eq(&u8x32::splat(b'"'));
@@ -1103,7 +1120,7 @@ where
                     _ => unreachable!(),
                 }
             } else {
-                self.read.eat(LANS)
+                self.read.eat(u8x32::LANES)
             }
         }
 
@@ -1211,7 +1228,7 @@ where
 
         while let Some(chunk) = reader.peek_n(64) {
             let input = array_ref![chunk, 0, 64];
-            if let Some(count) = skip_container_loop(
+            if let Some(count) = skip_container_loop::<u8x64>(
                 input,
                 &mut prev_instring,
                 &mut prev_escaped,
@@ -1231,7 +1248,7 @@ where
             let n = reader.remain();
             remain[..n].copy_from_slice(reader.peek_n(n).unwrap_unchecked());
         }
-        if let Some(count) = skip_container_loop(
+        if let Some(count) = skip_container_loop::<u8x64>(
             &remain,
             &mut prev_instring,
             &mut prev_escaped,
